@@ -1,0 +1,131 @@
+---
+title: "H_Index_Rcpp"
+author: "Nathan Quan"
+date: "3/26/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '/Users/nathansquan/Documents/DataScience/Segregation/')
+```
+
+# Overview
+
+## Goal
+
+Speed up data ingest and calculation of H Index using the `Rcpp` package.
+
+First we will demonstrate how to to calculate H Indices for a list of MSAs using R and benchmark it. Then we will implement C++ code to speed up these calculations and data ingest and compare the time it takes between the two methods.
+
+At a high level, both methods require us to:
+
+1. Get tract-level ACS income data for each MSA
+2. Calculate H Indices
+
+## Load Packages
+```{r load tidyverse echo=FALSE}
+library(tidyverse)
+```
+
+
+# Data ingest and initial cleaning
+
+## MSA Data
+
+MSA data are from the Census Bureau. I use the 2017 definitions of MSAs. This data contain the names and FIPS codes for all counties and the MSA in which they belong.
+
+https://www.census.gov/geographies/reference-files/time-series/demo/metro-micro/delineation-files.html
+
+```{r import MSA data}
+msa_2017 <- readxl::read_excel("data/raw/CBSA_Aug_2017.xls")
+#save(msa_2017, file = "MSA_2017.RData")
+```
+
+
+## Cleaning MSA data
+
+* Drop Notes at bottom of data frame (last 4 lines)
+
+* Join State FIPS with County FIPS
+
+* Filter missing and only to MSAs
+
+```{r Clean MSA data}
+
+str(msa_2017)
+
+msa_2017 <- msa_2017 %>%
+  head(-4)
+
+msa_2017$FIPS64 <- str_c(msa_2017$`FIPS State Code`, msa_2017$`FIPS County Code`)
+
+msa_2017 <- msa_2017 %>%
+  filter(!is.na(`CBSA Title`)) %>%
+  filter(`Metropolitan/Micropolitan Statistical Area` == "Metropolitan Statistical Area") %>%
+  select(`CBSA Code`, `CBSA Title`, `Metropolitan/Micropolitan Statistical Area`, `County/County Equivalent`, FIPS64)
+
+```
+
+
+## Load ACS variables
+
+Here we load a list of all variables for the 2017 ACS 5-year survey using the `tidycensus` package. Then we define a list of the income variables from ACS.
+```{r}
+vv <- tidycensus::load_variables(2017, 'acs5', cache = T)
+
+###Define 5-year ACS variables of interest
+
+## INCOME VARIABLE
+
+# Define income vars
+vars_inc <- c(
+
+  ## TABLE B19001: Household Income categories - TOTAL POP
+  "B19001_002", # Income <10k
+  "B19001_003", # Income 10-15k
+  "B19001_004", # Income 15-20k
+  "B19001_005", # Income 20-25k
+  "B19001_006", # Income 25-30k
+  "B19001_007", # Income 30-35k
+  "B19001_008", # Income 35-40k
+  "B19001_009", # Income 40-45k
+  "B19001_010", # Income 45-50k
+  "B19001_011", # Income 50-60k
+  "B19001_012", # Income 60-75k
+  "B19001_013", # Income 75-100k
+  "B19001_014", # Income 100-125k
+  "B19001_015", # Income 125-150k
+  "B19001_016", # Income 150-200k
+  "B19001_017" # Income 200+
+
+)
+```
+
+
+
+# The R-only way
+
+
+# Create a List of MSA objects
+
+Now that we have a list of all counties that are part of MSAs in the U.S., we need to place each county's FIPS code into an object for each MSA.
+
+The MSA objects will be named by their cbsa code.
+
+The for loop iterates over the CBSA code variable to create a list element named using the CBSA code in the current iteration. From there, we use `dplyr::filter()` to find all rows in the `msa_2017` data frame that has the current CBSA code.
+
+Finally, we check the number of unique CBSA codes in `msa_2017` to make sure the for loop works. There are 390 unique CBSA codes in `msa_2017` and 390 elements in `MSA_inc`.
+
+```{r}
+MSA_inc <- lst() #create empty list
+
+for (cbsa_code in msa_2017$`CBSA Code`) {
+  MSA_inc[[cbsa_code]] <- msa_2017 %>%
+    filter(`CBSA Code` %in% cbsa_code)
+}
+
+# Check
+length(unique(as.numeric(msa_2017$`CBSA Code`)))
+```
+
