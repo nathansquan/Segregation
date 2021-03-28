@@ -14,7 +14,7 @@ knitr::opts_knit$set(root.dir = '/Users/nathansquan/Documents/DataScience/Segreg
 
 ## Goal
 
-Speed up data ingest and calculation of H Index using the `Rcpp` package.
+Speed up data ingest and calculation of H Index using R-only first, and explore the `Rcpp` package.
 
 First we will demonstrate how to to calculate H Indices for a list of MSAs using R and benchmark it. Then we will implement C++ code to speed up these calculations and data ingest and compare the time it takes between the two methods.
 
@@ -63,7 +63,7 @@ msa_2017$FIPS64 <- str_c(msa_2017$`FIPS State Code`, msa_2017$`FIPS County Code`
 msa_2017 <- msa_2017 %>%
   filter(!is.na(`CBSA Title`)) %>%
   filter(`Metropolitan/Micropolitan Statistical Area` == "Metropolitan Statistical Area") %>%
-  select(`CBSA Code`, `CBSA Title`, `Metropolitan/Micropolitan Statistical Area`, `County/County Equivalent`, FIPS64)
+  select(`CBSA Code`, `CBSA Title`, `Metropolitan/Micropolitan Statistical Area`, `County/County Equivalent`, FIPS64, `FIPS State Code`, `FIPS County Code`)
 
 ```
 
@@ -107,7 +107,7 @@ vars_inc <- c(
 # The R-only way
 
 
-# Create a List of MSA objects
+## Create a List of MSA objects
 
 Now that we have a list of all counties that are part of MSAs in the U.S., we need to place each county's FIPS code into an object for each MSA.
 
@@ -115,17 +115,139 @@ The MSA objects will be named by their cbsa code.
 
 The for loop iterates over the CBSA code variable to create a list element named using the CBSA code in the current iteration. From there, we use `dplyr::filter()` to find all rows in the `msa_2017` data frame that has the current CBSA code.
 
-Finally, we check the number of unique CBSA codes in `msa_2017` to make sure the for loop works. There are 390 unique CBSA codes in `msa_2017` and 390 elements in `MSA_inc`.
+Finally, we check the number of unique CBSA codes in `msa_2017` to make sure the for loop works. There are 390 unique CBSA codes in `msa_2017` and 390 elements in `MSA_lst`.
 
 ```{r}
-MSA_inc <- lst() #create empty list
+MSA_lst <- lst() #create empty list
+
+msa_mark <- bench::mark(
 
 for (cbsa_code in msa_2017$`CBSA Code`) {
-  MSA_inc[[cbsa_code]] <- msa_2017 %>%
+  MSA_lst[[cbsa_code]] <- msa_2017 %>%
     filter(`CBSA Code` %in% cbsa_code)
 }
 
+)
+
 # Check
 length(unique(as.numeric(msa_2017$`CBSA Code`)))
+
+```
+
+
+
+
+## Acquire Income Data
+
+First create a vector of CBSA names from `MSA_lst` called `cbsaNames`. Then we instantiate `acs_inc` as an empty list. Next we loop through all of the MSA CBSA codes in `cbsaNames` so that we can obtain income data using `tidycensus::get_acs` for all tracts within the MSA.
+
+Remember how we created a list of all FIPS codes within the CBSA code objects in `MSA_lst`? We use those for the state and county arguments in `tidycensus::get_acs`! If you don't have a Census API key, you'll have to request one.
+```{r}
+cbsaNames <- names(MSA_lst) # create vector of CBSA names from MSA_lst
+
+ # loop through cbsaNames to retain CBSA code names in new list of income data
+acs_inc <- lst() # create empty list
+
+system.time(
+for(name in cbsaNames){
+ ## Obtain income data
+ acs_inc[[name]] <- tidycensus::get_acs(geography = 'tract',
+                           state = MSA_lst[[name]]$`FIPS State Code`,
+                           county = MSA_lst[[name]]$`FIPS County Code`,
+                           variables = vars_inc,
+                           year = 2017,
+                           survey = 'acs5',
+                           geometry = F,
+                           key = keyring::key_get("U.S. Census API"))
+
+   Sys.sleep(5) # Trying to get API call not to fail by building in 5-second pause
+
+}
+)
+```
+
+This process took 3967.033 seconds on my machine. (See Session Info section)
+
+```{r}
+### PREP DATA FOR RANKORDERSEG CALCULATION----
+
+## rankorderseg() from OasisR package requires an object of class matrix
+## where each column represents the distribution fo a group within spatial units
+## i.e. columns = income categories; rows = tracts
+
+## within the acs_inc list, each cbsa object has columns, GEOID, name, variable (income category), estimate, moe
+## want to have columns be the income categories and the rows be the tracts
+
+
+# loop through cbsaNames to retain CBSA code names in new list of income data in wide format
+## Pivot so that columns = income categories; rows = tracts
+acs_inc_wide <- lst() # create empty list
+for(name in cbsaNames){
+  acs_inc_wide[[name]] <- acs_inc[[name]] %>%
+    select(-moe, -NAME) %>%
+    pivot_wider(names_from = variable, values_from = estimate) %>%
+    select(-GEOID)
+
+  ## Removing duplicate income values due to collapsing tracts from pivot_wider
+  for (incomecat in vars_inc) {
+    
+    for (i in 1:nrow(acs_inc_wide[[name]])) {
+      acs_inc_wide[[name]][[incomecat]][[i]] <- acs_inc_wide[[name]][[incomecat]][[i]][!duplicated(acs_inc_wide[[name]][[incomecat]][[i]])]
+    }
+    
+  }
+
+
+}
+```
+
+
+
+
+
+```{r}
+## Calculate rankorder H indices----
+
+
+# loop through cbsaNames to retain CBSA code names in new list of calculated rankorder segregation indices
+msa_h <- lst() # create empty list
+for(name in cbsaNames){
+  msa_h[[name]] <- matrix(unlist(acs_inc_wide[[name]]),
+                       ncol=length(acs_inc_wide[[name]]),
+                       byrow=F) %>%
+    rankorderseg(polorder = 4, pred = c(0.10, 0.90))
+}
+
+
+save(msa_h, file = "msa_h.RData")
+```
+
+
+
+
+
+```{r}
+## Extract H index values----
+
+# Instantiate vectors for Index, H10, H90 to place extracted values in
+Index <- vector()
+H10 <- vector()
+H90 <- vector()
+
+# Overall H Index
+for(name in cbsaNames){
+  Index[[name]] <- unlist(msa_h[[name]]$Hr$Index)
+  H10[[name]] <- unlist(msa_h[[name]]$Hr$Predict$fit[[1]])
+  H90[[name]] <- unlist(msa_h[[name]]$Hr$Predict$fit[[2]])
+}
+
+msa_h_final <- bind_cols(list(cbsaNames, Index, H10, H90))
+
+  
+names(msa_h_final) <- c("CBSA.Code", "H.Index", "H10", "H90")
+
+msa_h_final$CBSA.Code <- str_replace(msa_h_final$CBSA.Code,"cbsa", "")
+
+save(msa_h_final, file = "msa_h_final.RData")
 ```
 
